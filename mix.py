@@ -11,8 +11,11 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 
 class CNN_LSTM(nn.Module):
-    def __init__(self, input_dim, seq_len, conv_channels, kernel_size, lstm_hidden_dim, lstm_layers, output_dim, dropout=0.5):
+    def __init__(self, input_dim, seq_len, conv_channels, kernel_size, lstm_hidden_dim, lstm_layers, output_seq_len, output_dim, dropout=0.5):
         super(CNN_LSTM, self).__init__()
+        
+        self.output_seq_len = output_seq_len  # 多步输出的时间长度
+        self.output_dim = output_dim  # 每个时间步的预测维度
         
         # CNN 部分
         self.conv1 = nn.Conv1d(in_channels=input_dim, 
@@ -29,13 +32,18 @@ class CNN_LSTM(nn.Module):
                             batch_first=True, 
                             dropout=dropout)
         
-        # 全连接层 (FC)
+        # 线性映射代替时间步选择
+        self.linear_time_mapping = nn.Linear(seq_len, output_seq_len)
+        
+        # 输出层
         self.fc = nn.Linear(lstm_hidden_dim, output_dim)
 
     def forward(self, x):
         """
         x: (batch_size, seq_len, input_dim)
         """
+        batch_size, seq_len, input_dim = x.size()
+
         # CNN 部分
         x = x.permute(0, 2, 1)  # 转换为 (batch_size, input_dim, seq_len) 适配 Conv1d
         x = self.conv1(x)       # (batch_size, conv_channels, seq_len)
@@ -45,11 +53,16 @@ class CNN_LSTM(nn.Module):
         
         # LSTM 部分
         lstm_out, _ = self.lstm(x)  # (batch_size, seq_len, lstm_hidden_dim)
-        lstm_out = lstm_out[:, -1, :]  # 仅取最后一个时间步的输出 (batch_size, lstm_hidden_dim)
         
-        # 全连接层
-        output = self.fc(lstm_out)  # (batch_size, output_dim)
-        return output
+        # 替代选择最后时间步：线性映射时间轴
+        lstm_out = lstm_out.permute(0, 2, 1)  # 转换为 (batch_size, lstm_hidden_dim, seq_len)
+        lstm_out = self.linear_time_mapping(lstm_out)  # (batch_size, lstm_hidden_dim, output_seq_len)
+        lstm_out = lstm_out.permute(0, 2, 1)  # 转回 (batch_size, output_seq_len, lstm_hidden_dim)
+        
+        # 输出映射
+        output = self.fc(lstm_out)  # (batch_size, output_seq_len, output_dim)
+        out = output[:, -1, :]  # 仅取最后一个时间步的输出
+        return out
 
 
 class HybridTimeSeriesModel(nn.Module):
@@ -93,20 +106,21 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 def train():
     model_params = {
         "input_dim": 10,              # 每个时间步的输入特征维度
-        "seq_len": 24,               # 输入序列长度
+        "seq_len": 96,               # 输入序列长度
         "conv_channels": 16,         # CNN 的卷积通道数
         "kernel_size": 3,            # CNN 的卷积核大小
         "lstm_hidden_dim": 32,       # LSTM 的隐藏层维度
         "lstm_layers": 2,            # LSTM 堆叠的层数
-        "output_dim": 3,             # 模型输出维度 (如单步预测)
-        "dropout": 0.3               # Dropout 比例
+        "output_dim": 1,           # 模型输出维度 单任务
+        "dropout": 0.3,               # Dropout 比例
+        "output_seq_len": 144      # 多步预测的时间长度
     }
     model = CNN_LSTM(**model_params).to(device)
 
     print(f"Training on {device}.")
     # 数据集
-    train_dataset = BikeRentalDataset('train_data.csv', seq_length=24)
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    train_dataset = BikeRentalDataset('train_data.csv', seq_length=96, output_time=240)
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, drop_last=False)
 
     
     # 定义损失函数和优化器
@@ -129,7 +143,7 @@ def train():
             outputs = model(inputs)
 
             # 计算损失
-            loss = loss_fn(outputs, targets)
+            loss = loss_fn(outputs, targets[:, -1, :])
 
             # 反向传播
             loss.backward()
@@ -146,26 +160,27 @@ def train():
 
         # 每个 epoch 可以添加模型的保存等操作（例如保存最佳模型等）
         if (epoch + 1) % 5 == 0:  # 例如每5个 epoch 保存一次
-            torch.save(model.state_dict(), f"hybid_model_epoch_{epoch+1}.pth")
+            torch.save(model.state_dict(), f"result/hybid_model_epoch_{epoch+1}.pth")
 
     print("Training complete.")
 
 def evaluate():
     model_params = {
         "input_dim": 10,              # 每个时间步的输入特征维度
-        "seq_len": 24,               # 输入序列长度
+        "seq_len": 96,               # 输入序列长度
         "conv_channels": 16,         # CNN 的卷积通道数
         "kernel_size": 3,            # CNN 的卷积核大小
         "lstm_hidden_dim": 32,       # LSTM 的隐藏层维度
         "lstm_layers": 2,            # LSTM 堆叠的层数
-        "output_dim": 3,             # 模型输出维度 (如单步预测)
-        "dropout": 0.3               # Dropout 比例
+        "output_dim": 1,           # 模型输出维度 单任务
+        "dropout": 0.3,               # Dropout 比例
+        "output_seq_len": 144      # 多步预测的时间长度
     }
     model = CNN_LSTM(**model_params).to(device)
-    model.load_state_dict(torch.load('hybid_model_epoch_20.pth'))
+    model.load_state_dict(torch.load('result/hybid_model_epoch_20.pth'))
     model.eval()  # 设置模型为评估模式
     # 加载测试数据集
-    test_dataset = BikeRentalDataset('test_data.csv')
+    test_dataset = BikeRentalDataset('test_data.csv', seq_length=96, output_time=240, json_file='scaled_features.json')
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
     
     # 读取缩放特征
@@ -183,12 +198,12 @@ def evaluate():
             # 特征输入到模型
             features = features.to(torch.float32).to(device)  # 将特征数据转换为float32类型
             
+            target = target[:, -1, :]  # 仅取最后一个时间步的目标值
             # 获取模型预测值
             predicted = model(features)  # 得到原始的预测值
             
             # 对预测结果进行反标准化，恢复到原始的尺度
             predicted = predicted * std + mean  # 反标准化公式
-            print(predicted)
             target = target * std + mean  # 反标准化公式
             targets.append(target[0].cpu().numpy())  # 保存目标值
             predictions.append(predicted[0].cpu().numpy())  # 保存预测值
