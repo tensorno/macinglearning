@@ -170,10 +170,7 @@ class Seq2Seq(nn.Module):
 #         # out = self.fc(out[:, -1, :])  # 取最后一个时间步的输出
 #         return out
 
-
-def lstm_train():
-    print(f"Training on {device}.")
-
+def train_eval(seq_length=96, output_time=240):
     args ={
         "input_size": 10,
         "hidden_size": 64,
@@ -181,72 +178,64 @@ def lstm_train():
         "output_size": 1,
         "batch_size": 32,
     }
-    # 定义模型
     model = Seq2Seq(**args).to(device)
     # 数据集
-    train_dataset = BikeRentalDataset('train_data.csv', seq_length=96, output_time=97)
+    train_dataset = BikeRentalDataset('train_data.csv', seq_length=seq_length, output_time=output_time)
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
 
-    # 定义损失函数和优化器
+    test_dataset = BikeRentalDataset('test_data.csv', json_file="scaled_features.json",seq_length=seq_length, output_time=output_time)
+    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+    maes = []
+    mses = []
     loss_fn = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=0.001)
-    epochs = 20
-    print("Training started.")
-    for epoch in range(epochs):
-        total_loss = 0.0
-        model.train()  # 设置模型为训练模式
-        running_loss = 0.0
-        for inputs, targets in train_loader:
-            # 送入设备（GPU 或 CPU）
-            inputs, targets = inputs.to(device), targets.to(device)
-            # 梯度清零
-            optimizer.zero_grad()
+    for i in range(5):
+        best_loss = float('inf')  # 初始化最小损失为正无穷
+        best_model_path = f"best_lstm_session_{i+1}_long.pth"  # 定义保存路径
+        for epoch in range(20):
+            total_loss = 0.0
+            model.train()
+            running_loss = 0.0
+            for inputs, targets in train_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                optimizer.zero_grad()
 
-            # 前向传播
-            outputs = model(inputs, target_len=1) 
-            # 计算损失
-            total_loss = loss_fn(outputs, targets)
-            # for k in range(3):
-            #     total_loss += loss_fn(outputs[k, :, :], targets[:, :, k])
-            # total_loss /= outputs.shape[0]
-            # 反向传播
-            total_loss.backward()
+                outputs = model(inputs, target_len=144)
+                total_loss = loss_fn(outputs, targets)
+                total_loss.backward()
+                optimizer.step()
+                running_loss += total_loss.item()
 
-            # 更新参数
-            optimizer.step()
+            # 计算当前 epoch 的平均损失
+            avg_loss = running_loss / len(train_loader)
+            print(f"Session {i+1}, Epoch {epoch+1}, Loss: {avg_loss:.4f}")
 
-            # 累加损失
-            running_loss += total_loss.item()
+            # 如果当前 epoch 损失优于之前的最优损失，则保存模型
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                torch.save(model.state_dict(), best_model_path)
+                print(f"New best model saved at {best_model_path} with loss {best_loss:.4f}")
 
-        # 每个 epoch 打印一次损失
-        avg_loss = running_loss / len(train_loader)
-        print(f"Epoch [{epoch+1}/{epochs}], Loss: {avg_loss:.4f}")
+        mae, mse = predict_lstm(model, best_model_path, test_loader)
+        maes.append(mae)
+        mses.append(mse)
+        model = Seq2Seq(**args).to(device) # 重新初始化模型
+        optimizer = optim.Adam(model.parameters(), lr=0.001)  # 重新初始化优化器
 
-        # 每个 epoch 可以添加模型的保存等操作（例如保存最佳模型等）
-        if (epoch + 1) % 5 == 0:  # 例如每5个 epoch 保存一次
-            torch.save(model.state_dict(), f"result/lstm_model_epoch_{epoch+1}_short.pth")
+    mae_std = np.std(maes)
+    print(f"MAE: {np.mean(maes):.2f}")
+    print(f"MAE std: {mae_std:.2f}")
+    mse_std = np.std(mses)
+    print(f"MSE: {np.mean(mses):.2f}")
+    print(f"MSE std: {mse_std:.2f}")
 
-    print("Training complete.")
-        
+            
 
-def predict_lstm():
+def predict_lstm(model, model_path, test_loader):
     # 加载训练好的模型
-    args ={
-        "input_size": 10,
-        "hidden_size": 64,
-        "num_layers": 2,
-        "output_size": 1,
-        "batch_size": 32,
-    }
-    # 定义模型
-    model = Seq2Seq(**args).to(device)
-    model.load_state_dict(torch.load('result/lstm_model_epoch_20_short.pth'))
-    model.eval()  # 设置模型为评估模式
-    
-    # 加载测试数据集
-    test_dataset = BikeRentalDataset(csv_file='test_data.csv', seq_length=96, output_time=97, json_file='scaled_features.json')  # 根据需要调整seq_length
 
-    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+    model.load_state_dict(torch.load(model_path))
+    model.eval()  # 设置模型为评估模式
     
     # 读取缩放特征
     filename = 'scaled_features.json'
@@ -264,7 +253,7 @@ def predict_lstm():
             features = features.to(torch.float32)  # 将特征数据转换为float32类型
             
             # 获取模型预测值
-            predicted = model(features, target_len=1)  # 得到原始的预测值
+            predicted = model(features, target_len=144)  # 得到原始的预测值
             predicted = predicted[:, -1, :]  # 取最后一个时间步的预测值
             target = target[:, -1, :]
             # print(predicted)
@@ -286,32 +275,32 @@ def predict_lstm():
     # 计算平均绝对误差（MAE）
     mae = mean_absolute_error(targets, predictions)
 
-    # 计算预测值的标准差（STD）
-    std = np.std(predictions)
+    return mse, mae
 
     # 打印结果
-    print(f"均方误差 (MSE): {mse:.2f}")
-    print(f"绝对误差 (MAE): {mae:.2f}")
-    print(f"预测值的标准差 (STD): {std:.2f}")
+    # print(f"均方误差 (MSE): {mse:.2f}")
+    # print(f"绝对误差 (MAE): {mae:.2f}")
+    # print(f"预测值的标准差 (STD): {std:.2f}")
 
-    # 将预测结果保存到 CSV 文件
-    prediction_df = pd.DataFrame({
-        'predictions': predictions.flatten(),  # 展平以确保是 1D 数组
-        'targets': targets.flatten()  # 展平目标值
-    })
-    # 将 DataFrame 保存到 CSV 文件
-    prediction_df.to_csv('predictions_with_targets_lstm.csv', index=False)
-    print("预测完成，结果保存在 'predictions.csv' 文件中")
-    # 绘制实际值与预测值的对比图
-    plt.figure(figsize=(12, 6))
-    plt.plot(targets, label='(Actual)', color='blue', alpha=0.6)
-    plt.plot(predictions, label='(Predicted)', color='red', alpha=0.6)
-    plt.legend()
-    plt.show()
+    # # 将预测结果保存到 CSV 文件
+    # prediction_df = pd.DataFrame({
+    #     'predictions': predictions.flatten(),  # 展平以确保是 1D 数组
+    #     'targets': targets.flatten()  # 展平目标值
+    # })
+    # # 将 DataFrame 保存到 CSV 文件
+    # prediction_df.to_csv('predictions_with_targets_lstm.csv', index=False)
+    # print("预测完成，结果保存在 'predictions.csv' 文件中")
+    # # 绘制实际值与预测值的对比图
+    # plt.figure(figsize=(12, 6))
+    # plt.plot(targets, label='(Actual)', color='blue', alpha=0.6)
+    # plt.plot(predictions, label='(Predicted)', color='red', alpha=0.6)
+    # plt.legend()
+    # plt.show()
 
 if __name__ == '__main__':
     # lstm_train()
-    predict_lstm()
+    # predict_lstm()
+    train_eval(seq_length=96, output_time=240)
     # train_dataset = BikeDataset(csv_file='train_data.csv')
     # test_dataset = BikeDataset(csv_file='test_data.csv', json_file='scaled_features.json')
     # train_dataset = BikeRentalDataset(csv_file='train_data.csv')
