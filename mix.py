@@ -103,7 +103,15 @@ class HybridTimeSeriesModel(nn.Module):
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def train():
+def train_eval(seq_length=96, output_time=97):
+    print(f"Training on {device}.")
+
+    train_dataset = BikeRentalDataset('train_data.csv', seq_length=seq_length, output_time=output_time)
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, drop_last=False)
+
+    test_dataset = BikeRentalDataset('test_data.csv', seq_length=seq_length, output_time=output_time)
+    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+
     model_params = {
         "input_dim": 10,              # 每个时间步的输入特征维度
         "seq_len": 96,               # 输入序列长度
@@ -113,58 +121,57 @@ def train():
         "lstm_layers": 2,            # LSTM 堆叠的层数
         "output_dim": 1,           # 模型输出维度 单任务
         "dropout": 0.3,               # Dropout 比例
-        "output_seq_len": 144      # 多步预测的时间长度
+        "output_seq_len": output_time - seq_length      # 多步预测的时间长度
     }
     model = CNN_LSTM(**model_params).to(device)
 
-    print(f"Training on {device}.")
-    # 数据集
-    train_dataset = BikeRentalDataset('train_data.csv', seq_length=96, output_time=240)
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, drop_last=False)
-
-    
-    # 定义损失函数和优化器
     loss_fn = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-    epochs = 20
     print("Training started.")
-    for epoch in range(epochs):
-        model.train()  # 设置模型为训练模式
-        running_loss = 0.0
-        for inputs, targets in train_loader:
-            # 送入设备（GPU 或 CPU）
-            inputs, targets = inputs.to(device), targets.to(device)
+    epochs = 20
+    maes = []
+    mses = []
+    for i in range(5):
+        model.train()
+        best_loss = float('inf')  # 初始化最小损失为正无穷
+        best_model_path = f"best_transfomer_session_{i+1}_short.pth"  # 定义保存路径
+        for epoch in range(epochs):
+            running_loss = 0.0
+            for inputs, targets in train_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                optimizer.zero_grad()
+                outputs = model(inputs)
+                loss = loss_fn(outputs, targets[:, -1, :])
+                loss.backward()
+                optimizer.step()
+                running_loss += loss.item()
+            avg_loss = running_loss / len(train_loader)
+            print(f"Epoch [{epoch+1}/{epochs}], Loss: {avg_loss:.4f}")
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                torch.save(model.state_dict(), best_model_path)
+        
 
-            # 梯度清零
-            optimizer.zero_grad()
+        mae, mse = evaluate(model, best_model_path, test_loader)
+        maes.append(mae)
+        mses.append(mse)
 
-            # 前向传播
-            outputs = model(inputs)
+        model = CNN_LSTM(**model_params).to(device)
+        optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-            # 计算损失
-            loss = loss_fn(outputs, targets[:, -1, :])
+    mae_std = np.std(maes)
+    print(f"MAE: {np.mean(maes):.2f}")
+    print(f"MAE std: {mae_std:.2f}")
+    mse_std = np.std(mses)
+    print(f"MSE: {np.mean(mses):.2f}")
+    print(f"MSE std: {mse_std:.2f}")
 
-            # 反向传播
-            loss.backward()
 
-            # 更新参数
-            optimizer.step()
 
-            # 累加损失
-            running_loss += loss.item()
 
-        # 每个 epoch 打印一次损失
-        avg_loss = running_loss / len(train_loader)
-        print(f"Epoch [{epoch+1}/{epochs}], Loss: {avg_loss:.4f}")
 
-        # 每个 epoch 可以添加模型的保存等操作（例如保存最佳模型等）
-        if (epoch + 1) % 5 == 0:  # 例如每5个 epoch 保存一次
-            torch.save(model.state_dict(), f"result/hybid_model_epoch_{epoch+1}.pth")
-
-    print("Training complete.")
-
-def evaluate():
+def evaluate(model, best_model_path, test_loader):
     model_params = {
         "input_dim": 10,              # 每个时间步的输入特征维度
         "seq_len": 96,               # 输入序列长度
@@ -174,15 +181,12 @@ def evaluate():
         "lstm_layers": 2,            # LSTM 堆叠的层数
         "output_dim": 1,           # 模型输出维度 单任务
         "dropout": 0.3,               # Dropout 比例
-        "output_seq_len": 144      # 多步预测的时间长度
+        "output_seq_len": 1     # 多步预测的时间长度
     }
     model = CNN_LSTM(**model_params).to(device)
-    model.load_state_dict(torch.load('result/hybid_model_epoch_20.pth'))
+    model.load_state_dict(torch.load(best_model_path))
     model.eval()  # 设置模型为评估模式
-    # 加载测试数据集
-    test_dataset = BikeRentalDataset('test_data.csv', seq_length=96, output_time=240, json_file='scaled_features.json')
-    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
-    
+
     # 读取缩放特征
     filename = 'scaled_features.json'
     scaled_features = json.load(open(filename, 'r'))
@@ -218,27 +222,21 @@ def evaluate():
     # 计算平均绝对误差（MAE）
     mae = mean_absolute_error(targets, predictions)
 
-    # 计算预测值的标准差（STD）
-    std = np.std(predictions)
+    return mae, mse
 
-      # 打印结果
-    print(f"均方误差 (MSE): {mse:.2f}")
-    print(f"绝对误差 (MAE): {mae:.2f}")
-    print(f"预测值的标准差 (STD): {std:.2f}")
-
-    # 将预测结果保存到 CSV 文件
-    prediction_df = pd.DataFrame({
-        'predictions': predictions.flatten(),  # 展平以确保是 1D 数组
-        'targets': targets.flatten()  # 展平目标值
-    })
-    # 将 DataFrame 保存到 CSV 文件
-    prediction_df.to_csv('predictions_with_targets_hybid.csv', index=False)
-    # 绘制实际值与预测值的对比图
-    plt.figure(figsize=(12, 6))
-    plt.plot(targets, label='(Actual)', color='blue', alpha=0.6)
-    plt.plot(predictions, label='(Predicted)', color='red', alpha=0.6)
-    plt.legend()
-    plt.show()
+    # # 将预测结果保存到 CSV 文件
+    # prediction_df = pd.DataFrame({
+    #     'predictions': predictions.flatten(),  # 展平以确保是 1D 数组
+    #     'targets': targets.flatten()  # 展平目标值
+    # })
+    # # 将 DataFrame 保存到 CSV 文件
+    # prediction_df.to_csv('predictions_with_targets_hybid.csv', index=False)
+    # # 绘制实际值与预测值的对比图
+    # plt.figure(figsize=(12, 6))
+    # plt.plot(targets, label='(Actual)', color='blue', alpha=0.6)
+    # plt.plot(predictions, label='(Predicted)', color='red', alpha=0.6)
+    # plt.legend()
+    # plt.show()
 
 # def train():
 #     model_params = {
@@ -376,5 +374,4 @@ def evaluate():
 #     plt.show()
 
 if __name__ == '__main__':
-    # train()
-    evaluate()
+    train_eval(seq_length=96, output_time=97)
